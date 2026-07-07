@@ -74,6 +74,27 @@ Add to your MCP config (e.g. `claude_desktop_config.json`):
 - `npm run build` — compiles to `build/`.
 - CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs typecheck, test, and build on every push/PR to `main`.
 
+## Publishing (for maintainers)
+
+Not yet published anywhere — this repo is currently the only distribution channel. To publish:
+
+1. **npm** (required before the MCP Registry, since the registry only hosts metadata):
+
+   ```sh
+   npm login
+   npm publish --access public
+   ```
+
+2. **MCP Registry** ([server.json](server.json) is already set up per the [official schema](https://modelcontextprotocol.io/registry/quickstart)):
+
+   ```sh
+   # install mcp-publisher (see quickstart link above for your platform)
+   mcp-publisher login github
+   mcp-publisher publish
+   ```
+
+3. **GitHub repo**: make it public (Settings → General → Danger Zone → Change visibility), then add topics `mcp`, `model-context-protocol`, `kobotoolbox`, `odk`, `ai-agent` for discoverability.
+
 ## Scope
 
 - Read-only by design: no tool creates, edits, or deletes forms or submissions.

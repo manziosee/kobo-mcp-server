@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.manziosee/kobo-mcp-server",
+  "description": "MCP server exposing KoboToolbox survey data (forms, submissions, media, geodata, QA checks) to AI agents",
+  "repository": {
+    "url": "https://github.com/manziosee/MCP",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "kobo-mcp-server",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "KOBO_API_TOKEN",
+          "description": "KoboToolbox API token (Account Settings -> Security -> API Token)",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "KOBO_BASE_URL",
+          "description": "Base URL of your Kobo server API, e.g. https://kf.kobotoolbox.org (default) or https://eu.kobotoolbox.org",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

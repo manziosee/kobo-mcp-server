@@ -1,15 +1,26 @@
 {
   "name": "kobo-mcp-server",
   "version": "0.1.0",
-  "description": "MCP server exposing KoboToolbox/ODK survey data (forms, submissions, summaries) to AI agents",
+  "description": "MCP server exposing KoboToolbox survey data (forms, submissions, media, geodata, QA checks) to AI agents",
+  "mcpName": "io.github.manziosee/kobo-mcp-server",
   "type": "module",
   "main": "build/index.js",
   "bin": {
     "kobo-mcp-server": "./build/index.js"
   },
   "files": [
-    "build"
+    "build",
+    "README.md",
+    "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manziosee/MCP.git"
+  },
+  "homepage": "https://github.com/manziosee/MCP#readme",
+  "bugs": {
+    "url": "https://github.com/manziosee/MCP/issues"
+  },
   "scripts": {
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', 0o755)\"",
     "dev": "tsx src/index.ts",
