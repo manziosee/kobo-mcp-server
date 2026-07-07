@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "kobo": {
+      "command": "node",
+      "args": ["build/index.js"]
+    }
+  }
+}
