@@ -3,6 +3,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { KoboApiError, type KoboClient } from "./kobo-client.js";
 import { rowsToCsv } from "./csv.js";
+import { parseGeopoint, isWithinBBox, toFeatureCollection, type GeoPoint, type BoundingBox } from "./geo.js";
 
 const MAX_SUBMISSION_LIMIT = 100;
 const MAX_SCAN_ROWS = 2000;
@@ -32,6 +33,8 @@ function withErrorHandling<Args extends Record<string, unknown>>(
     }
   };
 }
+
+const isEmpty = (value: unknown) => value === undefined || value === null || value === "";
 
 type BucketSize = "day" | "week" | "month";
 
@@ -66,7 +69,8 @@ export function registerTools(server: McpServer, client: KoboClient): void {
     {
       title: "Get Kobo form summary",
       description:
-        "Get metadata for one form: deployment status, submission count, dates, and the list of questions (name, type, label, required). Use this to understand a form's structure before querying submissions.",
+        "Get metadata for one form: deployment status, submission count, dates, and the list of questions (name, full path, type, label, required, enclosing repeat group). " +
+        "Use this to understand a form's structure before querying submissions. Cached in memory for a few minutes per form.",
       inputSchema: {
         uid: z.string().describe("The form's uid, from list_forms (e.g. 'aSAvYreNzVEkrWg5Gdcvg')"),
       },
@@ -201,9 +205,9 @@ export function registerTools(server: McpServer, client: KoboClient): void {
     {
       title: "Flag incomplete Kobo submissions",
       description:
-        "Find submissions missing an answer for one of the form's required questions. " +
-        "Compares each scanned submission against the form's required-field list from get_form_summary. " +
-        "Note: only checks top-level (non-repeat-group) required questions.",
+        "Find submissions missing an answer for one of the form's required questions, including questions inside repeat groups " +
+        "(each repeat instance is checked separately). Best-effort for repeat groups: matches submission JSON keys by full question " +
+        "path first, falling back to the bare question name, since Kobo's export shape for nested repeats can vary by form.",
       inputSchema: {
         uid: z.string().describe("The form's uid, from list_forms"),
         maxRows: z
@@ -217,9 +221,9 @@ export function registerTools(server: McpServer, client: KoboClient): void {
     },
     withErrorHandling(async ({ uid, maxRows }: { uid: string; maxRows?: number }) => {
       const summary = await client.getFormSummary(uid);
-      const requiredFields = summary.questions.filter((q) => q.required).map((q) => q.name);
+      const required = summary.questions.filter((q) => q.required);
 
-      if (requiredFields.length === 0) {
+      if (required.length === 0) {
         return ok({
           formUid: uid,
           requiredFieldCount: 0,
@@ -227,32 +231,284 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         });
       }
 
+      const topLevel = required.filter((q) => q.repeatPath === null);
+      const nested = required.filter((q) => q.repeatPath !== null);
+      const repeatPaths = Array.from(new Set(nested.map((q) => q.repeatPath as string)));
+
       const scanLimit = maxRows ?? 200;
       const { rows, truncated } = await client.getManySubmissions(uid, {
-        fields: [...requiredFields, "_id", "_uuid", "_submission_time"],
+        fields: [...topLevel.map((q) => q.path), ...repeatPaths, "_id", "_uuid", "_submission_time"],
         maxRows: scanLimit,
       });
 
-      const isEmpty = (value: unknown) => value === undefined || value === null || value === "";
-
       const incomplete = rows
-        .map((row) => ({
-          _id: row["_id"],
-          _uuid: row["_uuid"],
-          _submission_time: row["_submission_time"],
-          missingFields: requiredFields.filter((f) => isEmpty(row[f])),
-        }))
+        .map((row) => {
+          const missingFields: string[] = [];
+
+          for (const q of topLevel) {
+            if (isEmpty(row[q.path])) missingFields.push(q.path);
+          }
+
+          for (const repeatPath of repeatPaths) {
+            const instances = row[repeatPath];
+            if (!Array.isArray(instances)) continue;
+            const questionsInThisRepeat = nested.filter((q) => q.repeatPath === repeatPath);
+
+            instances.forEach((instance, idx) => {
+              if (typeof instance !== "object" || instance === null) return;
+              const record = instance as Record<string, unknown>;
+              for (const q of questionsInThisRepeat) {
+                const value = record[q.path] ?? record[q.name];
+                if (isEmpty(value)) missingFields.push(`${repeatPath}[${idx}].${q.name}`);
+              }
+            });
+          }
+
+          return {
+            _id: row["_id"],
+            _uuid: row["_uuid"],
+            _submission_time: row["_submission_time"],
+            missingFields,
+          };
+        })
         .filter((r) => r.missingFields.length > 0);
 
       const MAX_REPORTED = 50;
       return ok({
         formUid: uid,
-        requiredFieldCount: requiredFields.length,
+        requiredFieldCount: required.length,
         scannedCount: rows.length,
         scanTruncated: truncated,
         incompleteCount: incomplete.length,
         incomplete: incomplete.slice(0, MAX_REPORTED),
         reportTruncated: incomplete.length > MAX_REPORTED,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "get_submission_attachments",
+    {
+      title: "Get Kobo submission attachments",
+      description:
+        "List media attachments (photos, audio, video, files) for one submission, with download URLs. " +
+        "Download URLs require the same API token to fetch and may point to sensitive media (e.g. photos of people) — avoid restating or describing contents unnecessarily.",
+      inputSchema: {
+        uid: z.string().describe("The form's uid, from list_forms"),
+        submissionId: z
+          .union([z.string(), z.number()])
+          .describe("The submission's _id, from get_submissions or get_submission_stats"),
+      },
+    },
+    withErrorHandling(async ({ uid, submissionId }: { uid: string; submissionId: string | number }) =>
+      ok(await client.getSubmissionAttachments(uid, submissionId)),
+    ),
+  );
+
+  server.registerTool(
+    "get_geo_submissions",
+    {
+      title: "Get geo-tagged Kobo submissions",
+      description:
+        "Fetch submissions that have a geopoint answer and return them as GeoJSON (default) or plain JSON, optionally filtered to a bounding box. " +
+        "Auto-detects the form's first geopoint/geotrace/geoshape question unless geoField is given (use get_form_summary to find question paths/types).",
+      inputSchema: {
+        uid: z.string().describe("The form's uid, from list_forms"),
+        geoField: z
+          .string()
+          .optional()
+          .describe("Full path of the geopoint question to use, e.g. 'household/location'; auto-detected if omitted"),
+        bbox: z
+          .object({
+            minLat: z.number(),
+            minLon: z.number(),
+            maxLat: z.number(),
+            maxLon: z.number(),
+          })
+          .optional()
+          .describe("Optional bounding box filter, applied after fetching"),
+        format: z.enum(["geojson", "json"]).optional().describe("Output format, default 'geojson'"),
+        properties: z
+          .array(z.string())
+          .optional()
+          .describe("Extra submission fields to include as properties on each point"),
+        maxRows: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_SCAN_ROWS)
+          .optional()
+          .describe(`Max submissions to scan (<= ${MAX_SCAN_ROWS}), default 500`),
+      },
+    },
+    withErrorHandling(
+      async ({
+        uid,
+        geoField,
+        bbox,
+        format = "geojson",
+        properties,
+        maxRows,
+      }: {
+        uid: string;
+        geoField?: string;
+        bbox?: BoundingBox;
+        format?: "geojson" | "json";
+        properties?: string[];
+        maxRows?: number;
+      }) => {
+        let field = geoField;
+        if (!field) {
+          const summary = await client.getFormSummary(uid);
+          const geoQuestion = summary.questions.find(
+            (q) => q.type === "geopoint" || q.type === "geotrace" || q.type === "geoshape",
+          );
+          if (!geoQuestion) {
+            return ok({
+              formUid: uid,
+              message: "This form has no geopoint/geotrace/geoshape question. Pass geoField explicitly if one exists under a different type.",
+            });
+          }
+          field = geoQuestion.path;
+        }
+
+        const extraProps = properties ?? [];
+        const { rows, truncated } = await client.getManySubmissions(uid, {
+          fields: [field, "_id", "_uuid", "_submission_time", ...extraProps],
+          maxRows: maxRows ?? 500,
+        });
+
+        const points = rows
+          .map((row) => ({ row, point: parseGeopoint(row[field as string]) }))
+          .filter((r): r is { row: Record<string, unknown>; point: GeoPoint } => r.point !== null)
+          .filter((r) => !bbox || isWithinBBox(r.point, bbox));
+
+        const propsFor = (row: Record<string, unknown>) => ({
+          _id: row["_id"],
+          _uuid: row["_uuid"],
+          _submission_time: row["_submission_time"],
+          ...Object.fromEntries(extraProps.map((p) => [p, row[p]])),
+        });
+
+        if (format === "json") {
+          return ok({
+            formUid: uid,
+            geoField: field,
+            scannedCount: rows.length,
+            matchedCount: points.length,
+            scanTruncated: truncated,
+            points: points.map(({ row, point }) => ({ ...propsFor(row), ...point })),
+          });
+        }
+
+        const featureCollection = toFeatureCollection(
+          points.map(({ row, point }) => ({ point, properties: propsFor(row) })),
+        );
+
+        return ok({
+          formUid: uid,
+          geoField: field,
+          scannedCount: rows.length,
+          matchedCount: points.length,
+          scanTruncated: truncated,
+          ...featureCollection,
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "get_validation_summary",
+    {
+      title: "Get Kobo validation status summary",
+      description:
+        "Summarize submissions by Kobo's manual validation status (e.g. Approved / Not Approved / On Hold / not yet reviewed), " +
+        "with counts and percentages. Useful for M&E teams tracking review progress.",
+      inputSchema: {
+        uid: z.string().describe("The form's uid, from list_forms"),
+        maxRows: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_SCAN_ROWS)
+          .optional()
+          .describe(`Max submissions to scan (<= ${MAX_SCAN_ROWS}), default ${MAX_SCAN_ROWS}`),
+      },
+    },
+    withErrorHandling(async ({ uid, maxRows }: { uid: string; maxRows?: number }) => {
+      const { rows, totalCount, truncated } = await client.getManySubmissions(uid, {
+        fields: ["_validation_status"],
+        maxRows,
+      });
+
+      const counts = new Map<string, number>();
+      for (const row of rows) {
+        const status = row["_validation_status"];
+        let key = "not_reviewed";
+        if (status && typeof status === "object" && "uid" in (status as Record<string, unknown>)) {
+          key = String((status as Record<string, unknown>).uid ?? "not_reviewed") || "not_reviewed";
+        }
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+
+      const breakdown = Array.from(counts.entries())
+        .map(([status, count]) => ({
+          status,
+          count,
+          percent: rows.length ? Math.round((count / rows.length) * 1000) / 10 : 0,
+        }))
+        .sort((a, b) => b.count - a.count);
+
+      return ok({ formUid: uid, totalCount, scannedCount: rows.length, scanTruncated: truncated, breakdown });
+    }),
+  );
+
+  server.registerTool(
+    "find_duplicate_submissions",
+    {
+      title: "Find duplicate Kobo submissions",
+      description:
+        "Find submissions that share the same value for a given field (e.g. a phone number or national ID question) — " +
+        "a common field-data quality check. Blank/missing values are ignored.",
+      inputSchema: {
+        uid: z.string().describe("The form's uid, from list_forms"),
+        field: z.string().describe("Field name/path to check for duplicate values, from get_form_summary"),
+        maxRows: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_SCAN_ROWS)
+          .optional()
+          .describe(`Max submissions to scan (<= ${MAX_SCAN_ROWS}), default ${MAX_SCAN_ROWS}`),
+      },
+    },
+    withErrorHandling(async ({ uid, field, maxRows }: { uid: string; field: string; maxRows?: number }) => {
+      const { rows, truncated } = await client.getManySubmissions(uid, {
+        fields: [field, "_id", "_uuid", "_submission_time"],
+        maxRows,
+      });
+
+      const groups = new Map<string, Array<Record<string, unknown>>>();
+      for (const row of rows) {
+        const value = row[field];
+        if (isEmpty(value)) continue;
+        const key = String(value);
+        const list = groups.get(key) ?? [];
+        list.push({ _id: row["_id"], _uuid: row["_uuid"], _submission_time: row["_submission_time"] });
+        groups.set(key, list);
+      }
+
+      const duplicates = Array.from(groups.entries())
+        .filter(([, list]) => list.length > 1)
+        .map(([value, submissions]) => ({ value, count: submissions.length, submissions }));
+
+      return ok({
+        formUid: uid,
+        field,
+        scannedCount: rows.length,
+        scanTruncated: truncated,
+        duplicateGroupCount: duplicates.length,
+        duplicates,
       });
     }),
   );

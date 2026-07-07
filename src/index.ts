@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { KoboClient } from "./kobo-client.js";
 import { registerTools } from "./tools.js";
+import { registerResourcesAndPrompts } from "./resources.js";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -26,6 +27,7 @@ async function main() {
   });
 
   registerTools(server, client);
+  registerResourcesAndPrompts(server, client);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

@@ -156,4 +156,112 @@ describe("KoboClient", () => {
     assert.equal(truncated, true);
     assert.ok(calls >= 1);
   });
+
+  test("getFormSummary parses content.survey into path-aware questions", async () => {
+    globalThis.fetch = mock.fn(async () =>
+      jsonResponse({
+        uid: "formUid",
+        name: "Household Survey",
+        deployment_status: "deployed",
+        deployment__submission_count: 3,
+        date_created: "2026-01-01T00:00:00Z",
+        date_modified: "2026-01-02T00:00:00Z",
+        date_deployed: "2026-01-01T00:00:00Z",
+        content: {
+          survey: [
+            { type: "text", name: "enumerator", required: true, label: ["Enumerator"] },
+            { type: "begin_repeat", name: "members" },
+            { type: "text", name: "member_name", required: true, label: ["Name"] },
+            { type: "end_repeat" },
+          ],
+        },
+      }),
+    ) as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "tok" });
+    const summary = await client.getFormSummary("formUid");
+
+    assert.equal(summary.questionCount, 2);
+    assert.equal(summary.questions[0].path, "enumerator");
+    assert.equal(summary.questions[0].repeatPath, null);
+    assert.equal(summary.questions[1].path, "members/member_name");
+    assert.equal(summary.questions[1].repeatPath, "members");
+  });
+
+  test("getFormSummary caches results and skips a second fetch within the TTL", async () => {
+    const fetchMock = mock.fn(async () =>
+      jsonResponse({
+        uid: "formUid",
+        name: "Form",
+        deployment_status: "deployed",
+        deployment__submission_count: 0,
+        date_created: "2026-01-01T00:00:00Z",
+        date_modified: "2026-01-01T00:00:00Z",
+        content: { survey: [] },
+      }),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "tok", formSummaryCacheTtlMs: 60_000 });
+    await client.getFormSummary("formUid");
+    await client.getFormSummary("formUid");
+
+    assert.equal(fetchMock.mock.callCount(), 1);
+  });
+
+  test("getFormSummary bypasses the cache when skipCache is true", async () => {
+    const fetchMock = mock.fn(async () =>
+      jsonResponse({
+        uid: "formUid",
+        name: "Form",
+        deployment_status: "deployed",
+        deployment__submission_count: 0,
+        date_created: "2026-01-01T00:00:00Z",
+        date_modified: "2026-01-01T00:00:00Z",
+        content: { survey: [] },
+      }),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "tok", formSummaryCacheTtlMs: 60_000 });
+    await client.getFormSummary("formUid");
+    await client.getFormSummary("formUid", { skipCache: true });
+
+    assert.equal(fetchMock.mock.callCount(), 2);
+  });
+
+  test("getSubmissionAttachments maps _attachments from a single submission", async () => {
+    globalThis.fetch = mock.fn(async () =>
+      jsonResponse({
+        _id: 42,
+        _attachments: [
+          {
+            id: 7,
+            filename: "photo.jpg",
+            mimetype: "image/jpeg",
+            download_url: "https://kf.example.org/media/photo.jpg",
+            download_small_url: "https://kf.example.org/media/photo-small.jpg",
+          },
+        ],
+      }),
+    ) as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "tok" });
+    const attachments = await client.getSubmissionAttachments("formUid", 42);
+
+    assert.equal(attachments.length, 1);
+    assert.equal(attachments[0].filename, "photo.jpg");
+    assert.equal(attachments[0].downloadUrl, "https://kf.example.org/media/photo.jpg");
+    assert.equal(attachments[0].downloadSmallUrl, "https://kf.example.org/media/photo-small.jpg");
+    assert.equal(attachments[0].downloadLargeUrl, null);
+  });
+
+  test("getSubmissionAttachments returns an empty array when there are no attachments", async () => {
+    globalThis.fetch = mock.fn(async () => jsonResponse({ _id: 42 })) as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "tok" });
+    const attachments = await client.getSubmissionAttachments("formUid", 42);
+
+    assert.deepEqual(attachments, []);
+  });
 });
