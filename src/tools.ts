@@ -1,10 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { KoboApiError, type KoboClient } from "./kobo-client.js";
+import { KoboApiError, MAX_ATTACHMENT_BYTES, type KoboClient } from "./kobo-client.js";
 import { rowsToCsv } from "./csv.js";
 import { parseGeopoint, isWithinBBox, toFeatureCollection, type GeoPoint, type BoundingBox } from "./geo.js";
-import { buildChoiceIndex, resolveLanguageIndex, resolveRecordLabels } from "./choices.js";
+import { buildChoiceIndex, resolveChoiceLabel, resolveLanguageIndex, resolveRecordLabels } from "./choices.js";
 
 const MAX_SUBMISSION_LIMIT = 100;
 const MAX_SCAN_ROWS = 2000;
@@ -340,6 +340,80 @@ export function registerTools(server: McpServer, client: KoboClient): void {
   );
 
   server.registerTool(
+    "view_submission_attachment",
+    {
+      title: "View a Kobo submission attachment",
+      description:
+        "Fetch one image or audio attachment from a submission and return its actual content inline (viewable directly), " +
+        "rather than just a download URL. Only image/* and audio/* attachments are supported - for video or documents, use " +
+        `get_submission_attachments for the download URL instead. Rejects attachments over ${Math.round(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB; ` +
+        "pass a smaller size for large images. May return sensitive media (e.g. photos of people) - avoid restating or describing contents unnecessarily.",
+      inputSchema: {
+        uid: z.string().describe("The form's uid, from list_forms"),
+        submissionId: z
+          .union([z.string(), z.number()])
+          .describe("The submission's _id, from get_submissions or get_submission_stats"),
+        attachmentId: z
+          .union([z.string(), z.number()])
+          .describe("The attachment's id, from get_submission_attachments"),
+        size: z
+          .enum(["small", "medium", "large", "original"])
+          .optional()
+          .describe("Image variant to fetch, default 'medium'. Ignored for audio, which is always fetched as original."),
+      },
+    },
+    withErrorHandling(
+      async ({
+        uid,
+        submissionId,
+        attachmentId,
+        size = "medium",
+      }: {
+        uid: string;
+        submissionId: string | number;
+        attachmentId: string | number;
+        size?: "small" | "medium" | "large" | "original";
+      }) => {
+        const attachments = await client.getSubmissionAttachments(uid, submissionId);
+        const attachment = attachments.find((a) => String(a.id) === String(attachmentId));
+        if (!attachment) {
+          return errorResult(new Error(`No attachment with id ${attachmentId} on submission ${submissionId}.`));
+        }
+
+        const isImage = attachment.mimetype.startsWith("image/");
+        const isAudio = attachment.mimetype.startsWith("audio/");
+        if (!isImage && !isAudio) {
+          return errorResult(
+            new Error(
+              `Attachment mimetype "${attachment.mimetype}" isn't viewable inline; use get_submission_attachments for its download URL.`,
+            ),
+          );
+        }
+
+        const urlBySize: Record<string, string | null> = {
+          small: attachment.downloadSmallUrl,
+          medium: attachment.downloadMediumUrl,
+          large: attachment.downloadLargeUrl,
+          original: attachment.downloadUrl,
+        };
+        const url = (isImage ? urlBySize[size] : null) ?? attachment.downloadUrl;
+        if (!url) {
+          return errorResult(new Error(`No download URL available for attachment ${attachmentId}.`));
+        }
+
+        const content = await client.fetchAttachmentContent(url);
+        return {
+          content: [
+            isImage
+              ? { type: "image" as const, data: content.data, mimeType: content.mimeType }
+              : { type: "audio" as const, data: content.data, mimeType: content.mimeType },
+          ],
+        };
+      },
+    ),
+  );
+
+  server.registerTool(
     "get_geo_submissions",
     {
       title: "Get geo-tagged Kobo submissions",
@@ -611,6 +685,146 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           : "";
 
         return { content: [{ type: "text", text: `${csv}${note}` }] };
+      },
+    ),
+  );
+
+  server.registerTool(
+    "get_field_distribution",
+    {
+      title: "Get Kobo field answer distribution",
+      description:
+        "Summarize the answers for one question across a form's submissions: category counts and percentages for choice/text questions, " +
+        "or count/min/max/mean/median for numeric (integer/decimal/range) questions. select_multiple answers are counted per selected option " +
+        "(a submission can count toward more than one category, so percentages need not sum to 100). Missing/blank answers are reported " +
+        "separately and excluded from percentages.",
+      inputSchema: {
+        uid: z.string().describe("The form's uid, from list_forms"),
+        field: z.string().describe("Field name/path to summarize, from get_form_summary"),
+        resolveLabels: z
+          .boolean()
+          .optional()
+          .describe("Resolve select_one/select_multiple codes to choice labels, default true"),
+        language: z
+          .string()
+          .optional()
+          .describe("Language name for resolved labels, for multi-language forms; defaults to the form's first/default language"),
+        maxCategories: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe("Max distinct categories to report for choice/text questions, default 30; the rest are folded into otherCount"),
+        maxRows: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_SCAN_ROWS)
+          .optional()
+          .describe(`Max submissions to scan (<= ${MAX_SCAN_ROWS}), default ${MAX_SCAN_ROWS}`),
+      },
+    },
+    withErrorHandling(
+      async ({
+        uid,
+        field,
+        resolveLabels = true,
+        language,
+        maxCategories,
+        maxRows,
+      }: {
+        uid: string;
+        field: string;
+        resolveLabels?: boolean;
+        language?: string;
+        maxCategories?: number;
+        maxRows?: number;
+      }) => {
+        const summary = await client.getFormSummary(uid);
+        const question = summary.questions.find((q) => q.path === field || q.name === field);
+
+        const { rows, truncated } = await client.getManySubmissions(uid, { fields: [field], maxRows });
+
+        let missingCount = 0;
+        const values: unknown[] = [];
+        for (const row of rows) {
+          const raw = row[field];
+          if (isEmpty(raw)) {
+            missingCount++;
+            continue;
+          }
+          values.push(raw);
+        }
+
+        const isNumeric = question ? ["integer", "decimal", "range"].includes(question.type) : false;
+
+        if (isNumeric) {
+          const numbers = values.map((v) => Number(v)).filter((n) => Number.isFinite(n));
+          const sorted = [...numbers].sort((a, b) => a - b);
+          const mean = numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : null;
+          const mid = Math.floor(sorted.length / 2);
+          const median = sorted.length
+            ? sorted.length % 2 === 1
+              ? sorted[mid]
+              : (sorted[mid - 1] + sorted[mid]) / 2
+            : null;
+
+          return ok({
+            formUid: uid,
+            field,
+            type: "numeric",
+            scannedCount: rows.length,
+            scanTruncated: truncated,
+            answeredCount: numbers.length,
+            missingCount,
+            min: sorted.length ? sorted[0] : null,
+            max: sorted.length ? sorted[sorted.length - 1] : null,
+            mean: mean !== null ? Math.round(mean * 100) / 100 : null,
+            median,
+          });
+        }
+
+        const isSelectMultiple = question?.type === "select_multiple";
+        const shouldResolve = Boolean(resolveLabels && question?.selectFromListName);
+        const index = shouldResolve ? buildChoiceIndex(summary.choices) : null;
+        const languageIndex = shouldResolve ? resolveLanguageIndex(summary.translations, language) : 0;
+
+        const counts = new Map<string, number>();
+        for (const raw of values) {
+          const codes = isSelectMultiple ? String(raw).split(/\s+/).filter(Boolean) : [String(raw)];
+          for (const code of codes) {
+            const label =
+              index && question?.selectFromListName
+                ? resolveChoiceLabel(index, question.selectFromListName, code, languageIndex)
+                : code;
+            counts.set(label, (counts.get(label) ?? 0) + 1);
+          }
+        }
+
+        const limit = maxCategories ?? 30;
+        const sortedCounts = Array.from(counts.entries()).sort(([, a], [, b]) => b - a);
+        const top = sortedCounts.slice(0, limit);
+        const otherCount = sortedCounts.slice(limit).reduce((sum, [, c]) => sum + c, 0);
+        const denominator = values.length;
+
+        return ok({
+          formUid: uid,
+          field,
+          type: question?.type ?? "unknown",
+          scannedCount: rows.length,
+          scanTruncated: truncated,
+          answeredCount: values.length,
+          missingCount,
+          categories: top.map(([value, count]) => ({
+            value,
+            count,
+            percent: denominator ? Math.round((count / denominator) * 1000) / 10 : 0,
+          })),
+          otherCategoryCount: Math.max(0, sortedCounts.length - top.length),
+          otherCount,
+          categoriesTruncated: sortedCounts.length > top.length,
+        });
       },
     ),
   );

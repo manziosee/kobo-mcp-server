@@ -36,6 +36,11 @@ function labelFor(index: ChoiceIndex, listName: string, code: string, languageIn
   return raw;
 }
 
+/** Resolves a single select_one/select_multiple option code to its label. Unknown codes are returned as-is. */
+export function resolveChoiceLabel(index: ChoiceIndex, listName: string, code: string, languageIndex: number): string {
+  return labelFor(index, listName, code, languageIndex);
+}
+
 /**
  * Replaces select_one/select_multiple submission values with their human-readable choice
  * labels (from the form's content.choices), including inside repeat-group instances.

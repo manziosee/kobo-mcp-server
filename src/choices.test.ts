@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { buildChoiceIndex, resolveLanguageIndex, resolveRecordLabels } from "./choices.js";
+import { buildChoiceIndex, resolveChoiceLabel, resolveLanguageIndex, resolveRecordLabels } from "./choices.js";
 import type { FormQuestion } from "./survey-schema.js";
 
 function question(overrides: Partial<FormQuestion>): FormQuestion {
@@ -30,6 +30,29 @@ describe("buildChoiceIndex", () => {
   test("skips choices missing list_name or name", () => {
     const index = buildChoiceIndex([{ list_name: "yes_no" }, { name: "yes" }, {}]);
     assert.equal(index.size, 0);
+  });
+});
+
+describe("resolveChoiceLabel", () => {
+  const index = buildChoiceIndex([
+    { list_name: "yes_no", name: "yes", label: ["Yes", "Oui"] },
+    { list_name: "yes_no", name: "no", label: ["No", "Non"] },
+  ]);
+
+  test("resolves a code to its label", () => {
+    assert.equal(resolveChoiceLabel(index, "yes_no", "yes", 0), "Yes");
+  });
+
+  test("resolves in a non-default language", () => {
+    assert.equal(resolveChoiceLabel(index, "yes_no", "yes", 1), "Oui");
+  });
+
+  test("leaves an unknown code as-is", () => {
+    assert.equal(resolveChoiceLabel(index, "yes_no", "maybe", 0), "maybe");
+  });
+
+  test("leaves a code from an unknown list as-is", () => {
+    assert.equal(resolveChoiceLabel(index, "nope", "yes", 0), "yes");
   });
 });
 

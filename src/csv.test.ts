@@ -29,4 +29,17 @@ describe("rowsToCsv", () => {
     const csv = rowsToCsv([{ a: null, b: undefined }], ["a", "b"]);
     assert.equal(csv, "a,b\n,");
   });
+
+  test("neutralizes leading formula characters in string values", () => {
+    const csv = rowsToCsv(
+      [{ a: "=cmd|'/c calc'!A1", b: "+1+1", c: "-2+3", d: "@SUM(A1)", e: "plain" }],
+      ["a", "b", "c", "d", "e"],
+    );
+    assert.equal(csv, "a,b,c,d,e\n'=cmd|'/c calc'!A1,'+1+1,'-2+3,'@SUM(A1),plain");
+  });
+
+  test("does not mangle legitimate negative numbers (non-string values)", () => {
+    const csv = rowsToCsv([{ lon: -71.06 }], ["lon"]);
+    assert.equal(csv, "lon\n-71.06");
+  });
 });

@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { KoboClient, KoboApiError } from "./kobo-client.js";
+import { KoboClient, KoboApiError, MAX_ATTACHMENT_BYTES } from "./kobo-client.js";
 
 const BASE_URL = "https://kf.example.org";
 
@@ -277,5 +277,67 @@ describe("KoboClient", () => {
     const attachments = await client.getSubmissionAttachments("formUid", 42);
 
     assert.deepEqual(attachments, []);
+  });
+
+  test("fetchAttachmentContent sends the auth token and returns base64 data + mimetype", async () => {
+    let capturedHeaders: HeadersInit | undefined;
+    globalThis.fetch = mock.fn(async (_input: string | URL, init?: RequestInit) => {
+      capturedHeaders = init?.headers;
+      return new Response(new Uint8Array([1, 2, 3, 4]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg" },
+      });
+    }) as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "secret-tok" });
+    const content = await client.fetchAttachmentContent("https://kf.example.org/media/photo.jpg");
+
+    assert.equal((capturedHeaders as Record<string, string>).Authorization, "Token secret-tok");
+    assert.equal(content.mimeType, "image/jpeg");
+    assert.equal(content.data, Buffer.from([1, 2, 3, 4]).toString("base64"));
+  });
+
+  test("fetchAttachmentContent throws a KoboApiError on a non-ok response", async () => {
+    globalThis.fetch = mock.fn(async () => new Response("not found", { status: 404, statusText: "Not Found" })) as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "tok" });
+    await assert.rejects(
+      () => client.fetchAttachmentContent("https://kf.example.org/media/missing.jpg"),
+      (err: unknown) => {
+        if (!(err instanceof KoboApiError)) throw new Error(`expected KoboApiError, got ${String(err)}`);
+        assert.equal(err.status, 404);
+        return true;
+      },
+    );
+  });
+
+  test("fetchAttachmentContent rejects when content-length exceeds the max", async () => {
+    globalThis.fetch = mock.fn(
+      async () =>
+        new Response(new Uint8Array(1), {
+          status: 200,
+          headers: {
+            "content-type": "image/jpeg",
+            "content-length": String(MAX_ATTACHMENT_BYTES + 1),
+          },
+        }),
+    ) as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "tok" });
+    await assert.rejects(() => client.fetchAttachmentContent("https://kf.example.org/media/huge.jpg"), /too large/i);
+  });
+
+  test("fetchAttachmentContent rejects an oversized body even without a content-length header", async () => {
+    globalThis.fetch = mock.fn(async () => {
+      const response = new Response(new Uint8Array(MAX_ATTACHMENT_BYTES + 1), {
+        status: 200,
+        headers: { "content-type": "image/jpeg" },
+      });
+      response.headers.delete("content-length");
+      return response;
+    }) as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "tok" });
+    await assert.rejects(() => client.fetchAttachmentContent("https://kf.example.org/media/huge.jpg"), /too large/i);
   });
 });

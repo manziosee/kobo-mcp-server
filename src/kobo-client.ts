@@ -83,6 +83,15 @@ const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 const MAX_RETRIES = 2;
 const BASE_BACKOFF_MS = 400;
 
+/** Max attachment size returned inline by fetchAttachmentContent, in bytes. Base64 inflates this ~1.33x. */
+export const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+
+export interface AttachmentContent {
+  /** Base64-encoded bytes. */
+  data: string;
+  mimeType: string;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -276,6 +285,46 @@ export class KoboClient {
       downloadMediumUrl: (a.download_medium_url as string | undefined) ?? null,
       downloadLargeUrl: (a.download_large_url as string | undefined) ?? null,
     }));
+  }
+
+  /**
+   * Fetches an attachment's raw bytes (e.g. one of a submission's download URLs) using this
+   * client's auth token, for tools that need to return the content itself rather than a URL.
+   * Rejects anything over MAX_ATTACHMENT_BYTES rather than buffering an unbounded response.
+   */
+  async fetchAttachmentContent(url: string): Promise<AttachmentContent> {
+    const response = await fetch(url, {
+      headers: { Authorization: `Token ${this.apiToken}` },
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new KoboApiError(
+        `Failed to fetch attachment (${response.status} ${response.statusText}): ${body.slice(0, 500)}`,
+        response.status,
+      );
+    }
+
+    const contentLengthHeader = response.headers.get("content-length");
+    if (contentLengthHeader && Number(contentLengthHeader) > MAX_ATTACHMENT_BYTES) {
+      throw new Error(
+        `Attachment is too large to return inline (${contentLengthHeader} bytes, max ${MAX_ATTACHMENT_BYTES}). ` +
+          "Request a smaller size, or use the download URL directly instead.",
+      );
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength > MAX_ATTACHMENT_BYTES) {
+      throw new Error(
+        `Attachment is too large to return inline (${buffer.byteLength} bytes, max ${MAX_ATTACHMENT_BYTES}). ` +
+          "Request a smaller size, or use the download URL directly instead.",
+      );
+    }
+
+    return {
+      data: buffer.toString("base64"),
+      mimeType: response.headers.get("content-type") ?? "application/octet-stream",
+    };
   }
 
   /**
