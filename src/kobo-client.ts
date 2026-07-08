@@ -1,7 +1,9 @@
 import { buildQuestionPaths, type FormQuestion, type RawSurveyItem } from "./survey-schema.js";
 import { buildRedactSet, redactRecord } from "./redact.js";
+import type { RawChoiceItem } from "./choices.js";
 
 export type { FormQuestion } from "./survey-schema.js";
+export type { RawChoiceItem } from "./choices.js";
 
 export interface KoboClientConfig {
   baseUrl: string;
@@ -38,6 +40,10 @@ export interface FormSummary {
   dateDeployed: string | null;
   questionCount: number;
   questions: FormQuestion[];
+  /** Raw choice-list options (content.choices), for resolving select_one/select_multiple codes to labels. */
+  choices: RawChoiceItem[];
+  /** Form language names in translation order (content.translations); index 0 is the default language. May contain nulls for unnamed languages. */
+  translations: (string | null)[];
 }
 
 export interface Attachment {
@@ -202,6 +208,8 @@ export class KoboClient {
       date_deployed?: string | null;
       content?: {
         survey?: RawSurveyItem[];
+        choices?: RawChoiceItem[];
+        translations?: (string | null)[];
       };
     } = await this.request(`/api/v2/assets/${encodeURIComponent(uid)}/`);
 
@@ -217,6 +225,8 @@ export class KoboClient {
       dateDeployed: data.date_deployed ?? null,
       questionCount: questions.length,
       questions,
+      choices: data.content?.choices ?? [],
+      translations: data.content?.translations ?? [],
     };
 
     if (this.formSummaryCacheTtlMs > 0) {

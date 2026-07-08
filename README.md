@@ -6,14 +6,14 @@ MCP server exposing KoboToolbox survey data (forms, submissions, media, geodata,
 
 - `list_forms` — list all forms visible to the API token, with deployment status and submission counts.
 - `get_form_summary` — metadata for one form: dates, submission count, and question list (name, full path, type, label, required, enclosing repeat group). Cached in memory for a few minutes per form.
-- `get_submissions` — paginated submissions for a form, with an optional Mongo-style `query` filter, `sort`, and `fields` selection.
+- `get_submissions` — paginated submissions for a form, with an optional Mongo-style `query` filter, `sort`, and `fields` selection. By default, `select_one`/`select_multiple` answers are resolved from raw codes (`"opt_a"`) to human-readable choice labels (`"Yes, has access to clean water"`) using the form's choice lists — pass `resolveLabels: false` for raw codes, or `language` for a non-default form language.
 - `get_submission_stats` — total count, date range, and a trend bucketed by day/week/month.
 - `flag_incomplete_submissions` — submissions missing an answer for a required question, including questions inside repeat groups (checked per repeat instance, best-effort — see Notes).
 - `get_submission_attachments` — list photo/audio/video/file attachments for one submission, with download URLs.
 - `get_geo_submissions` — submissions with a geopoint answer, as GeoJSON (default) or plain JSON, with optional bounding-box filtering.
 - `get_validation_summary` — breakdown of submissions by Kobo's manual validation status (Approved / Not Approved / On Hold / not reviewed).
 - `find_duplicate_submissions` — submissions sharing the same value for a given field (e.g. a phone number or ID question).
-- `export_submissions_csv` — submissions as CSV text for the agent to save or hand off to another tool.
+- `export_submissions_csv` — submissions as CSV text for the agent to save or hand off to another tool. Same choice-label resolution as `get_submissions`, on by default.
 
 ## Resources & prompts
 
@@ -122,4 +122,5 @@ If you're deploying this against real humanitarian or personal data, the practic
 - Requests retry automatically on transient failures (429/502/503/504 or network errors), up to 2 retries with backoff; 4xx errors (bad token, missing form) fail immediately and are returned as a tool error rather than crashing the server. Verified live against a real KoboToolbox server with an invalid token.
 - `flag_incomplete_submissions`'s repeat-group handling is best-effort: it matches submission JSON keys by the question's full path first, falling back to the bare question name, since Kobo's export shape for nested repeats isn't fully documented and hasn't been verified against a live account with repeat groups.
 - If a field is both `required` and in `KOBO_REDACT_FIELDS`, `flag_incomplete_submissions` will see `[REDACTED]` (a non-empty string) rather than the real value, so a genuinely blank answer on that field won't be flagged as missing — redaction is applied before any tool logic runs, with no exceptions. Similarly, redacting the field passed to `find_duplicate_submissions` makes every submission look identical on that field (a visibly wrong result, not a silent leak). Both are the deliberate cost of enforcing redaction in one place rather than per-tool.
-- Not yet verified against a real KoboToolbox account with actual form data — verified so far: auth/error paths (401/404) against the live API, and all response-shape assumptions against unit tests with mocked responses.
+- Choice-label resolution only handles `select_one` and `select_multiple` question types (not e.g. `select_one_from_file`), matches choices to questions by the form's `content.choices`/`select_from_list_name`, and applies inside repeat groups using the same best-effort key matching as `flag_incomplete_submissions`. `resolveLabels` costs one extra `get_form_summary` call per `get_submissions`/`export_submissions_csv` call, mitigated by the form-schema cache. `query`/`sort` always operate on raw stored codes — resolution only affects what's returned, never what's matched.
+- Not yet verified against a real KoboToolbox account with actual form data (including choice-label resolution) — the connected account currently has zero forms. Verified so far: auth/error paths (401/404) against the live API, tool schemas (including the new `resolveLabels`/`language` params) via a live `tools/list` call, and all response-shape assumptions against unit tests with mocked responses (50 tests as of this feature).

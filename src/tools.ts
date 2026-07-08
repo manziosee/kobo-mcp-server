@@ -4,6 +4,7 @@ import { z } from "zod";
 import { KoboApiError, type KoboClient } from "./kobo-client.js";
 import { rowsToCsv } from "./csv.js";
 import { parseGeopoint, isWithinBBox, toFeatureCollection, type GeoPoint, type BoundingBox } from "./geo.js";
+import { buildChoiceIndex, resolveLanguageIndex, resolveRecordLabels } from "./choices.js";
 
 const MAX_SUBMISSION_LIMIT = 100;
 const MAX_SCAN_ROWS = 2000;
@@ -52,6 +53,21 @@ function bucketKey(dateIso: string, bucket: BucketSize): string {
   return d.toISOString().slice(0, 10);
 }
 
+/** Resolves select_one/select_multiple codes to human-readable labels using the form's choice lists. No-op if the form has no choices. */
+async function applyLabelResolution(
+  client: KoboClient,
+  uid: string,
+  rows: Record<string, unknown>[],
+  language: string | undefined,
+): Promise<Record<string, unknown>[]> {
+  const summary = await client.getFormSummary(uid);
+  if (summary.choices.length === 0) return rows;
+
+  const index = buildChoiceIndex(summary.choices);
+  const languageIndex = resolveLanguageIndex(summary.translations, language);
+  return rows.map((row) => resolveRecordLabels(row, summary.questions, index, languageIndex));
+}
+
 export function registerTools(server: McpServer, client: KoboClient): void {
   server.registerTool(
     "list_forms",
@@ -84,6 +100,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
       title: "Get Kobo form submissions",
       description:
         `Fetch submissions for a form, paginated (max ${MAX_SUBMISSION_LIMIT} per call). Supports a Mongo-style query filter, sort, and field selection to keep responses small. ` +
+        "By default, select_one/select_multiple answers are resolved from raw codes (e.g. \"opt_a\") to their human-readable choice labels (e.g. \"Yes, has access to clean water\") using the form's choice lists — pass resolveLabels: false for raw codes instead. " +
         "Submission data may contain personal or sensitive information (names, GPS coordinates, health/protection data) — treat it accordingly and avoid restating it unnecessarily.",
       inputSchema: {
         uid: z.string().describe("The form's uid, from list_forms"),
@@ -91,7 +108,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .record(z.string(), z.unknown())
           .optional()
           .describe(
-            "Optional Mongo-style filter, e.g. {\"_submission_time\": {\"$gte\": \"2026-07-01\"}} or {\"group/city\": \"Kigali\"}",
+            "Optional Mongo-style filter, e.g. {\"_submission_time\": {\"$gte\": \"2026-07-01\"}} or {\"group/city\": \"Kigali\"}. Filters always match raw stored codes, not resolved labels.",
           ),
         start: z.number().int().min(0).optional().describe("Offset for pagination, default 0"),
         limit: z
@@ -109,6 +126,14 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .array(z.string())
           .optional()
           .describe("Optional list of field names to return instead of the full submission"),
+        resolveLabels: z
+          .boolean()
+          .optional()
+          .describe("Resolve select_one/select_multiple codes to choice labels, default true"),
+        language: z
+          .string()
+          .optional()
+          .describe("Language name for resolved labels (e.g. 'French'), for multi-language forms; defaults to the form's first/default language"),
       },
     },
     withErrorHandling(
@@ -119,6 +144,8 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         limit,
         sort,
         fields,
+        resolveLabels = true,
+        language,
       }: {
         uid: string;
         query?: Record<string, unknown>;
@@ -126,7 +153,14 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         limit?: number;
         sort?: Record<string, 1 | -1>;
         fields?: string[];
-      }) => ok(await client.getSubmissions(uid, { query, start, limit, sort, fields })),
+        resolveLabels?: boolean;
+        language?: string;
+      }) => {
+        const page = await client.getSubmissions(uid, { query, start, limit, sort, fields });
+        if (!resolveLabels) return ok(page);
+        const results = await applyLabelResolution(client, uid, page.results, language);
+        return ok({ count: page.count, results });
+      },
     ),
   );
 
@@ -519,6 +553,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
       title: "Export Kobo submissions as CSV",
       description:
         "Fetch submissions for a form and return them as CSV text (not a file) for the agent to save or analyze further. " +
+        "By default, select_one/select_multiple answers are resolved to their human-readable choice labels (see get_submissions) — pass resolveLabels: false for raw codes instead. " +
         "Contains raw submission data, which may be sensitive — avoid restating it unnecessarily.",
       inputSchema: {
         uid: z.string().describe("The form's uid, from list_forms"),
@@ -537,6 +572,14 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .max(MAX_SCAN_ROWS)
           .optional()
           .describe(`Max rows to export (<= ${MAX_SCAN_ROWS}), default 500`),
+        resolveLabels: z
+          .boolean()
+          .optional()
+          .describe("Resolve select_one/select_multiple codes to choice labels, default true"),
+        language: z
+          .string()
+          .optional()
+          .describe("Language name for resolved labels, for multi-language forms; defaults to the form's first/default language"),
       },
     },
     withErrorHandling(
@@ -545,11 +588,15 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         query,
         fields,
         maxRows,
+        resolveLabels = true,
+        language,
       }: {
         uid: string;
         query?: Record<string, unknown>;
         fields?: string[];
         maxRows?: number;
+        resolveLabels?: boolean;
+        language?: string;
       }) => {
         const { rows, totalCount, truncated } = await client.getManySubmissions(uid, {
           query,
@@ -557,7 +604,8 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           maxRows: maxRows ?? 500,
         });
 
-        const csv = rowsToCsv(rows, fields);
+        const outputRows = resolveLabels ? await applyLabelResolution(client, uid, rows, language) : rows;
+        const csv = rowsToCsv(outputRows, fields);
         const note = truncated
           ? `\n\n(Note: exported ${rows.length} of ${totalCount} matching submissions; increase maxRows or narrow the query for more.)`
           : "";

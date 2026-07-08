@@ -4,6 +4,7 @@ export interface RawSurveyItem {
   $autoname?: string;
   label?: string[] | string;
   required?: boolean;
+  select_from_list_name?: string;
 }
 
 export interface FormQuestion {
@@ -16,6 +17,8 @@ export interface FormQuestion {
   required: boolean;
   /** Path of the nearest enclosing repeat group, or null if this question isn't inside a repeat. */
   repeatPath: string | null;
+  /** For select_one/select_multiple questions, the content.choices list_name to resolve values against; otherwise null. */
+  selectFromListName: string | null;
 }
 
 const GROUP_BEGIN = new Set(["begin_group", "begin group"]);
@@ -73,6 +76,7 @@ export function buildQuestionPaths(survey: RawSurveyItem[]): FormQuestion[] {
       label: normalizeLabel(item.label),
       required: item.required === true,
       repeatPath,
+      selectFromListName: item.select_from_list_name ?? null,
     });
   }
 

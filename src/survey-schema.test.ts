@@ -17,9 +17,22 @@ describe("buildQuestionPaths", () => {
       label: "Full name",
       required: true,
       repeatPath: null,
+      selectFromListName: null,
     });
     assert.equal(questions[1].required, false);
     assert.equal(questions[1].repeatPath, null);
+  });
+
+  test("select questions carry their choice list name", () => {
+    const questions = buildQuestionPaths([
+      { type: "select_one", name: "has_water", select_from_list_name: "yes_no" },
+      { type: "select_multiple", name: "services", select_from_list_name: "service_list" },
+      { type: "text", name: "notes" },
+    ]);
+
+    assert.equal(questions[0].selectFromListName, "yes_no");
+    assert.equal(questions[1].selectFromListName, "service_list");
+    assert.equal(questions[2].selectFromListName, null);
   });
 
   test("nested group: path is slash-joined, repeatPath is null", () => {
