@@ -81,6 +81,18 @@ describe("KoboClient", () => {
     assert.equal(forms[1].owner, null);
   });
 
+  test("getSubmissions redacts configured fields before returning", async () => {
+    globalThis.fetch = mock.fn(async () =>
+      jsonResponse({ count: 1, results: [{ _id: 1, phone: "555-0123", name: "Jane" }] }),
+    ) as unknown as typeof fetch;
+
+    const client = new KoboClient({ baseUrl: BASE_URL, apiToken: "tok", redactFields: ["phone"] });
+    const page = await client.getSubmissions("formUid");
+
+    assert.equal(page.results[0].phone, "[REDACTED]");
+    assert.equal(page.results[0].name, "Jane");
+  });
+
   test("getSubmissions serializes query/sort/fields as JSON params", async () => {
     let capturedUrl: URL | undefined;
     globalThis.fetch = mock.fn(async (input: string | URL) => {
@@ -113,7 +125,9 @@ describe("KoboClient", () => {
     await assert.rejects(
       () => client.getFormSummary("missing"),
       (err: unknown) => {
-        assert.ok(err instanceof KoboApiError);
+        if (!(err instanceof KoboApiError)) {
+          throw new Error(`expected KoboApiError, got ${String(err)}`);
+        }
         assert.equal(err.status, 404);
         return true;
       },

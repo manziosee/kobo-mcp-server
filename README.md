@@ -100,10 +100,26 @@ Not yet published anywhere — this repo is currently the only distribution chan
 - Read-only by design: no tool creates, edits, or deletes forms or submissions.
 - KoboToolbox only. ODK Central uses a different auth model (session login, no static API token) and a different submissions API (OData-based); it's deliberately out of scope for this server rather than bolted on unverified.
 
+## Data protection & liability
+
+**This is not legal advice, and nothing here is a guarantee against legal risk.** Whether it's safe to connect this server to real survey data is a legal/compliance question (data protection law, your org's data-sharing agreements with beneficiaries or donors, sector rules for protection/health data) that only your own legal counsel or DPO can answer for your situation — code can reduce exposure, but it can't clear you.
+
+What this project does to reduce risk, and what remains your responsibility:
+
+- **You are the data controller, not this tool.** This server is a pass-through: it can only see what your `KOBO_API_TOKEN` can already see. Scope the token to the narrowest account/role that has what you need — Kobo tokens are per-user, so create a dedicated account with access to only the relevant forms if you can.
+- **`KOBO_REDACT_FIELDS`** — set this to a comma-separated list of field names (e.g. `phone,national_id,name`) to have the server replace those values with `[REDACTED]` in every tool's output, unconditionally. This is enforced once, in the API client, so it can't be bypassed by any current or future tool — including CSV export and duplicate detection (which means a redacted field can no longer be used for deduplication; that trade-off is intentional, since leaking the value would be worse).
+- **Nothing is logged.** Response bodies (submission content, attachment contents) are never written to stdout/stderr/disk by this server; only error messages and, if configured, the list of redacted field names at startup.
+- **Read-only.** No tool can alter or delete Kobo data, which limits the blast radius of a misused token but doesn't address disclosure.
+- **Downstream data flow is outside this server's control.** Whatever a tool returns becomes part of the conversation sent to your AI provider (e.g. Anthropic) and may be retained per that provider's data-handling terms — check those terms if that matters for your compliance obligations, independent of anything this server does.
+- **The MIT license's "AS IS" clause** (see [LICENSE](LICENSE)) disclaims warranty and liability for the software itself, which is standard for open source — it does not and cannot discharge your obligations as a data controller when you choose to connect this to production beneficiary/protection data.
+
+If you're deploying this against real humanitarian or personal data, the practical checklist before you do: get sign-off from whoever owns data protection compliance at your org, scope the API token tightly, and set `KOBO_REDACT_FIELDS` for anything you don't want an AI model to ever see.
+
 ## Notes
 
 - Submission payloads (and attachments) can contain personal or sensitive data (names, GPS, photos, health/protection info) — this server doesn't log response bodies, and `get_submissions`/`export_submissions_csv`/`get_geo_submissions` support field selection to request only what's needed.
 - `get_submissions` caps `limit` at 100 per call; page through with `start` for larger pulls. The scanning tools (`get_submission_stats`, `flag_incomplete_submissions`, `get_geo_submissions`, `get_validation_summary`, `find_duplicate_submissions`, `export_submissions_csv`) page internally up to a `maxRows` cap (default varies by tool, hard max 2000) to avoid unbounded API usage.
 - Requests retry automatically on transient failures (429/502/503/504 or network errors), up to 2 retries with backoff; 4xx errors (bad token, missing form) fail immediately and are returned as a tool error rather than crashing the server. Verified live against a real KoboToolbox server with an invalid token.
 - `flag_incomplete_submissions`'s repeat-group handling is best-effort: it matches submission JSON keys by the question's full path first, falling back to the bare question name, since Kobo's export shape for nested repeats isn't fully documented and hasn't been verified against a live account with repeat groups.
+- If a field is both `required` and in `KOBO_REDACT_FIELDS`, `flag_incomplete_submissions` will see `[REDACTED]` (a non-empty string) rather than the real value, so a genuinely blank answer on that field won't be flagged as missing — redaction is applied before any tool logic runs, with no exceptions. Similarly, redacting the field passed to `find_duplicate_submissions` makes every submission look identical on that field (a visibly wrong result, not a silent leak). Both are the deliberate cost of enforcing redaction in one place rather than per-tool.
 - Not yet verified against a real KoboToolbox account with actual form data — verified so far: auth/error paths (401/404) against the live API, and all response-shape assumptions against unit tests with mocked responses.

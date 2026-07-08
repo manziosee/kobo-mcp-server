@@ -22,10 +22,10 @@
     "url": "https://github.com/manziosee/MCP/issues"
   },
   "scripts": {
-    "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', 0o755)\"",
+    "build": "tsc -p tsconfig.build.json && node -e \"require('fs').chmodSync('build/index.js', 0o755)\"",
     "dev": "tsx src/index.ts",
     "start": "node build/index.js",
-    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test src/**/*.test.ts",
     "inspector": "npx @modelcontextprotocol/inspector node build/index.js"
   },

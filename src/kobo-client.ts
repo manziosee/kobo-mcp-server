@@ -1,4 +1,5 @@
 import { buildQuestionPaths, type FormQuestion, type RawSurveyItem } from "./survey-schema.js";
+import { buildRedactSet, redactRecord } from "./redact.js";
 
 export type { FormQuestion } from "./survey-schema.js";
 
@@ -7,6 +8,13 @@ export interface KoboClientConfig {
   apiToken: string;
   /** How long to cache a form's schema (from getFormSummary) in memory, in ms. Default 5 minutes. Set 0 to disable. */
   formSummaryCacheTtlMs?: number;
+  /**
+   * Field names (bare, e.g. "phone_number", or full path, e.g. "household/phone_number") to
+   * replace with "[REDACTED]" in every submission returned by this client, regardless of which
+   * tool or query asked for them. Enforced here rather than per-tool so it can't be bypassed by
+   * any current or future tool that reads submission data.
+   */
+  redactFields?: string[];
 }
 
 export interface FormListItem {
@@ -80,11 +88,13 @@ export class KoboClient {
   private readonly apiToken: string;
   private readonly formSummaryCacheTtlMs: number;
   private readonly formSummaryCache = new Map<string, { data: FormSummary; expiresAt: number }>();
+  private readonly redactKeys: Set<string>;
 
   constructor(config: KoboClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, "");
     this.apiToken = config.apiToken;
     this.formSummaryCacheTtlMs = config.formSummaryCacheTtlMs ?? DEFAULT_FORM_SUMMARY_CACHE_TTL_MS;
+    this.redactKeys = buildRedactSet(config.redactFields);
   }
 
   private async request<T>(path: string, searchParams?: URLSearchParams): Promise<T> {
@@ -232,11 +242,14 @@ export class KoboClient {
     }
 
     const data: SubmissionsPage = await this.request(`/api/v2/assets/${encodeURIComponent(uid)}/data/`, params);
-    return data;
+    return { count: data.count, results: data.results.map((r) => redactRecord(r, this.redactKeys)) };
   }
 
   async getSubmission(uid: string, submissionId: number | string): Promise<Record<string, unknown>> {
-    return this.request(`/api/v2/assets/${encodeURIComponent(uid)}/data/${encodeURIComponent(String(submissionId))}/`);
+    const submission: Record<string, unknown> = await this.request(
+      `/api/v2/assets/${encodeURIComponent(uid)}/data/${encodeURIComponent(String(submissionId))}/`,
+    );
+    return redactRecord(submission, this.redactKeys);
   }
 
   async getSubmissionAttachments(uid: string, submissionId: number | string): Promise<Attachment[]> {

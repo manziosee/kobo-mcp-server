@@ -18,8 +18,15 @@ function requireEnv(name: string): string {
 async function main() {
   const apiToken = requireEnv("KOBO_API_TOKEN");
   const baseUrl = process.env.KOBO_BASE_URL || "https://kf.kobotoolbox.org";
+  const redactFields = (process.env.KOBO_REDACT_FIELDS ?? "")
+    .split(",")
+    .map((f) => f.trim())
+    .filter(Boolean);
 
-  const client = new KoboClient({ baseUrl, apiToken });
+  const client = new KoboClient({ baseUrl, apiToken, redactFields });
+  if (redactFields.length > 0) {
+    console.error(`kobo-mcp-server: redacting fields: ${redactFields.join(", ")}`);
+  }
 
   const server = new McpServer({
     name: "kobo-mcp-server",
