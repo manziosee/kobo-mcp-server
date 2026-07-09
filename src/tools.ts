@@ -8,6 +8,8 @@ import { buildChoiceIndex, resolveChoiceLabel, resolveLanguageIndex, resolveReco
 
 const MAX_SUBMISSION_LIMIT = 100;
 const MAX_SCAN_ROWS = 2000;
+const DEFAULT_MAX_FORMS_SCANNED = 50;
+const MAX_FORMS_SCANNED = 100;
 
 function errorResult(err: unknown): CallToolResult {
   const message =
@@ -36,6 +38,33 @@ function withErrorHandling<Args extends Record<string, unknown>>(
 }
 
 const isEmpty = (value: unknown) => value === undefined || value === null || value === "";
+
+const sinceUntilSchema = {
+  sinceDate: z
+    .string()
+    .optional()
+    .describe("Only include submissions on/after this date (ISO 8601, e.g. '2026-07-01'). Shorthand for a _submission_time $gte filter."),
+  untilDate: z
+    .string()
+    .optional()
+    .describe("Only include submissions on/before this date (ISO 8601). Shorthand for a _submission_time $lte filter."),
+};
+
+/**
+ * Merges sinceDate/untilDate convenience params into a Mongo-style query as a _submission_time
+ * range, overriding any _submission_time key already in query (documented in each tool's schema).
+ */
+function withDateRange(
+  query: Record<string, unknown> | undefined,
+  sinceDate: string | undefined,
+  untilDate: string | undefined,
+): Record<string, unknown> | undefined {
+  if (!sinceDate && !untilDate) return query;
+  const range: Record<string, string> = {};
+  if (sinceDate) range.$gte = sinceDate;
+  if (untilDate) range.$lte = untilDate;
+  return { ...query, _submission_time: range };
+}
 
 type BucketSize = "day" | "week" | "month";
 
@@ -110,6 +139,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .describe(
             "Optional Mongo-style filter, e.g. {\"_submission_time\": {\"$gte\": \"2026-07-01\"}} or {\"group/city\": \"Kigali\"}. Filters always match raw stored codes, not resolved labels.",
           ),
+        ...sinceUntilSchema,
         start: z.number().int().min(0).optional().describe("Offset for pagination, default 0"),
         limit: z
           .number()
@@ -140,6 +170,8 @@ export function registerTools(server: McpServer, client: KoboClient): void {
       async ({
         uid,
         query,
+        sinceDate,
+        untilDate,
         start,
         limit,
         sort,
@@ -149,6 +181,8 @@ export function registerTools(server: McpServer, client: KoboClient): void {
       }: {
         uid: string;
         query?: Record<string, unknown>;
+        sinceDate?: string;
+        untilDate?: string;
         start?: number;
         limit?: number;
         sort?: Record<string, 1 | -1>;
@@ -156,7 +190,13 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         resolveLabels?: boolean;
         language?: string;
       }) => {
-        const page = await client.getSubmissions(uid, { query, start, limit, sort, fields });
+        const page = await client.getSubmissions(uid, {
+          query: withDateRange(query, sinceDate, untilDate),
+          start,
+          limit,
+          sort,
+          fields,
+        });
         if (!resolveLabels) return ok(page);
         const results = await applyLabelResolution(client, uid, page.results, language);
         return ok({ count: page.count, results });
@@ -177,6 +217,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .record(z.string(), z.unknown())
           .optional()
           .describe("Optional Mongo-style filter applied before bucketing, e.g. {\"group/city\": \"Kigali\"}"),
+        ...sinceUntilSchema,
         bucket: z.enum(["day", "week", "month"]).optional().describe("Trend bucket size, default 'day'"),
         maxRows: z
           .number()
@@ -191,16 +232,20 @@ export function registerTools(server: McpServer, client: KoboClient): void {
       async ({
         uid,
         query,
+        sinceDate,
+        untilDate,
         bucket = "day",
         maxRows,
       }: {
         uid: string;
         query?: Record<string, unknown>;
+        sinceDate?: string;
+        untilDate?: string;
         bucket?: BucketSize;
         maxRows?: number;
       }) => {
         const { rows, totalCount, truncated } = await client.getManySubmissions(uid, {
-          query,
+          query: withDateRange(query, sinceDate, untilDate),
           fields: ["_submission_time"],
           maxRows,
         });
@@ -244,6 +289,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         "path first, falling back to the bare question name, since Kobo's export shape for nested repeats can vary by form.",
       inputSchema: {
         uid: z.string().describe("The form's uid, from list_forms"),
+        ...sinceUntilSchema,
         maxRows: z
           .number()
           .int()
@@ -253,7 +299,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .describe(`Max submissions to scan (<= ${MAX_SCAN_ROWS}), default 200`),
       },
     },
-    withErrorHandling(async ({ uid, maxRows }: { uid: string; maxRows?: number }) => {
+    withErrorHandling(async ({ uid, sinceDate, untilDate, maxRows }: { uid: string; sinceDate?: string; untilDate?: string; maxRows?: number }) => {
       const summary = await client.getFormSummary(uid);
       const required = summary.questions.filter((q) => q.required);
 
@@ -271,6 +317,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
 
       const scanLimit = maxRows ?? 200;
       const { rows, truncated } = await client.getManySubmissions(uid, {
+        query: withDateRange(undefined, sinceDate, untilDate),
         fields: [...topLevel.map((q) => q.path), ...repeatPaths, "_id", "_uuid", "_submission_time"],
         maxRows: scanLimit,
       });
@@ -440,6 +487,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .array(z.string())
           .optional()
           .describe("Extra submission fields to include as properties on each point"),
+        ...sinceUntilSchema,
         maxRows: z
           .number()
           .int()
@@ -456,6 +504,8 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         bbox,
         format = "geojson",
         properties,
+        sinceDate,
+        untilDate,
         maxRows,
       }: {
         uid: string;
@@ -463,6 +513,8 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         bbox?: BoundingBox;
         format?: "geojson" | "json";
         properties?: string[];
+        sinceDate?: string;
+        untilDate?: string;
         maxRows?: number;
       }) => {
         let field = geoField;
@@ -482,6 +534,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
 
         const extraProps = properties ?? [];
         const { rows, truncated } = await client.getManySubmissions(uid, {
+          query: withDateRange(undefined, sinceDate, untilDate),
           fields: [field, "_id", "_uuid", "_submission_time", ...extraProps],
           maxRows: maxRows ?? 500,
         });
@@ -534,6 +587,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         "with counts and percentages. Useful for M&E teams tracking review progress.",
       inputSchema: {
         uid: z.string().describe("The form's uid, from list_forms"),
+        ...sinceUntilSchema,
         maxRows: z
           .number()
           .int()
@@ -543,8 +597,9 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .describe(`Max submissions to scan (<= ${MAX_SCAN_ROWS}), default ${MAX_SCAN_ROWS}`),
       },
     },
-    withErrorHandling(async ({ uid, maxRows }: { uid: string; maxRows?: number }) => {
+    withErrorHandling(async ({ uid, sinceDate, untilDate, maxRows }: { uid: string; sinceDate?: string; untilDate?: string; maxRows?: number }) => {
       const { rows, totalCount, truncated } = await client.getManySubmissions(uid, {
+        query: withDateRange(undefined, sinceDate, untilDate),
         fields: ["_validation_status"],
         maxRows,
       });
@@ -581,6 +636,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
       inputSchema: {
         uid: z.string().describe("The form's uid, from list_forms"),
         field: z.string().describe("Field name/path to check for duplicate values, from get_form_summary"),
+        ...sinceUntilSchema,
         maxRows: z
           .number()
           .int()
@@ -590,8 +646,22 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .describe(`Max submissions to scan (<= ${MAX_SCAN_ROWS}), default ${MAX_SCAN_ROWS}`),
       },
     },
-    withErrorHandling(async ({ uid, field, maxRows }: { uid: string; field: string; maxRows?: number }) => {
+    withErrorHandling(
+      async ({
+        uid,
+        field,
+        sinceDate,
+        untilDate,
+        maxRows,
+      }: {
+        uid: string;
+        field: string;
+        sinceDate?: string;
+        untilDate?: string;
+        maxRows?: number;
+      }) => {
       const { rows, truncated } = await client.getManySubmissions(uid, {
+        query: withDateRange(undefined, sinceDate, untilDate),
         fields: [field, "_id", "_uuid", "_submission_time"],
         maxRows,
       });
@@ -635,6 +705,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .record(z.string(), z.unknown())
           .optional()
           .describe("Optional Mongo-style filter, e.g. {\"_submission_time\": {\"$gte\": \"2026-07-01\"}}"),
+        ...sinceUntilSchema,
         fields: z
           .array(z.string())
           .optional()
@@ -660,6 +731,8 @@ export function registerTools(server: McpServer, client: KoboClient): void {
       async ({
         uid,
         query,
+        sinceDate,
+        untilDate,
         fields,
         maxRows,
         resolveLabels = true,
@@ -667,13 +740,15 @@ export function registerTools(server: McpServer, client: KoboClient): void {
       }: {
         uid: string;
         query?: Record<string, unknown>;
+        sinceDate?: string;
+        untilDate?: string;
         fields?: string[];
         maxRows?: number;
         resolveLabels?: boolean;
         language?: string;
       }) => {
         const { rows, totalCount, truncated } = await client.getManySubmissions(uid, {
-          query,
+          query: withDateRange(query, sinceDate, untilDate),
           fields,
           maxRows: maxRows ?? 500,
         });
@@ -716,6 +791,7 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           .max(200)
           .optional()
           .describe("Max distinct categories to report for choice/text questions, default 30; the rest are folded into otherCount"),
+        ...sinceUntilSchema,
         maxRows: z
           .number()
           .int()
@@ -732,6 +808,8 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         resolveLabels = true,
         language,
         maxCategories,
+        sinceDate,
+        untilDate,
         maxRows,
       }: {
         uid: string;
@@ -739,12 +817,18 @@ export function registerTools(server: McpServer, client: KoboClient): void {
         resolveLabels?: boolean;
         language?: string;
         maxCategories?: number;
+        sinceDate?: string;
+        untilDate?: string;
         maxRows?: number;
       }) => {
         const summary = await client.getFormSummary(uid);
         const question = summary.questions.find((q) => q.path === field || q.name === field);
 
-        const { rows, truncated } = await client.getManySubmissions(uid, { fields: [field], maxRows });
+        const { rows, truncated } = await client.getManySubmissions(uid, {
+          query: withDateRange(undefined, sinceDate, untilDate),
+          fields: [field],
+          maxRows,
+        });
 
         let missingCount = 0;
         const values: unknown[] = [];
@@ -824,6 +908,117 @@ export function registerTools(server: McpServer, client: KoboClient): void {
           otherCategoryCount: Math.max(0, sortedCounts.length - top.length),
           otherCount,
           categoriesTruncated: sortedCounts.length > top.length,
+        });
+      },
+    ),
+  );
+
+  server.registerTool(
+    "search_all_forms",
+    {
+      title: "Search a field across all Kobo forms",
+      description:
+        "Find submissions with a given value in a given question, across every form the API token can see (e.g. find every " +
+        "submission with a specific phone number or national ID, without knowing which form it was collected on). Matches a " +
+        "question by its bare name (not full path), so it works even if the field lives at different paths on different forms; " +
+        "only matches top-level questions (not ones inside repeat groups) since exact-match filtering doesn't reliably reach " +
+        "into nested repeat data. Forms without a matching question, or that error while scanning, are reported separately, not silently dropped.",
+      inputSchema: {
+        field: z.string().describe("Bare question name to search for, e.g. 'phone_number' (not a full group/path)"),
+        value: z.string().describe("Exact value to search for"),
+        deploymentStatus: z
+          .enum(["deployed", "archived", "draft", "any"])
+          .optional()
+          .describe("Only scan forms with this deployment status, default 'deployed' (draft forms have no submissions)"),
+        maxForms: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_FORMS_SCANNED)
+          .optional()
+          .describe(`Max forms to scan (<= ${MAX_FORMS_SCANNED}), default ${DEFAULT_MAX_FORMS_SCANNED}`),
+        maxRowsPerForm: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_SCAN_ROWS)
+          .optional()
+          .describe(`Max submissions to scan per matching form (<= ${MAX_SCAN_ROWS}), default 500`),
+      },
+    },
+    withErrorHandling(
+      async ({
+        field,
+        value,
+        deploymentStatus = "deployed",
+        maxForms,
+        maxRowsPerForm,
+      }: {
+        field: string;
+        value: string;
+        deploymentStatus?: "deployed" | "archived" | "draft" | "any";
+        maxForms?: number;
+        maxRowsPerForm?: number;
+      }) => {
+        const allForms = await client.listForms();
+        const candidateForms =
+          deploymentStatus === "any" ? allForms : allForms.filter((f) => f.deploymentStatus === deploymentStatus);
+        const forms = candidateForms.slice(0, maxForms ?? DEFAULT_MAX_FORMS_SCANNED);
+
+        const matches: Array<{
+          formUid: string;
+          formName: string;
+          _id: unknown;
+          _uuid: unknown;
+          _submission_time: unknown;
+        }> = [];
+        const formsSkipped: Array<{ formUid: string; formName: string; reason: string }> = [];
+        let formsWithFieldCount = 0;
+
+        for (const form of forms) {
+          try {
+            const summary = await client.getFormSummary(form.uid);
+            const question = summary.questions.find((q) => q.name === field && q.repeatPath === null);
+            if (!question) {
+              formsSkipped.push({ formUid: form.uid, formName: form.name, reason: "no matching top-level question" });
+              continue;
+            }
+            formsWithFieldCount++;
+
+            const { rows } = await client.getManySubmissions(form.uid, {
+              query: { [question.path]: value },
+              fields: [question.path, "_id", "_uuid", "_submission_time"],
+              maxRows: maxRowsPerForm ?? 500,
+            });
+
+            for (const row of rows) {
+              matches.push({
+                formUid: form.uid,
+                formName: form.name,
+                _id: row["_id"],
+                _uuid: row["_uuid"],
+                _submission_time: row["_submission_time"],
+              });
+            }
+          } catch (err) {
+            formsSkipped.push({
+              formUid: form.uid,
+              formName: form.name,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        return ok({
+          field,
+          value,
+          formsAvailable: candidateForms.length,
+          formsScanned: forms.length,
+          formsScanTruncated: candidateForms.length > forms.length,
+          formsWithFieldCount,
+          formsSkipped,
+          matchCount: matches.length,
+          matches,
         });
       },
     ),

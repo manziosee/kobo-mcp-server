@@ -16,6 +16,9 @@ MCP server exposing KoboToolbox survey data (forms, submissions, media, geodata,
 - `find_duplicate_submissions` — submissions sharing the same value for a given field (e.g. a phone number or ID question).
 - `get_field_distribution` — answer distribution for one question: category counts/percentages for choice or text questions, or min/max/mean/median for numeric questions.
 - `export_submissions_csv` — submissions as CSV text for the agent to save or hand off to another tool. Same choice-label resolution as `get_submissions`, on by default.
+- `search_all_forms` — find a value (e.g. a phone number or national ID) in a given question across every form the API token can see, without knowing which form it was collected on. Matches top-level questions only (not inside repeat groups).
+
+Every tool that scans submissions also accepts `sinceDate`/`untilDate` (ISO dates) as shorthand for a `_submission_time` range filter, instead of hand-writing a Mongo `query`.
 
 ## Resources & prompts
 
@@ -74,6 +77,8 @@ Add to your MCP config (e.g. `claude_desktop_config.json`):
 - `npm run typecheck` — type-checks source and tests (the production `build` excludes `*.test.ts`).
 - `npm test` — runs the unit test suite (Node's built-in test runner, `fetch` mocked — no live Kobo account needed).
 - `npm run build` — compiles to `build/`.
+- `npm run inspector` — opens the [MCP Inspector](https://github.com/modelcontextprotocol/inspector), a web UI to call every tool interactively against your real `.env` credentials and see live results (the MCP equivalent of Swagger UI, since this is a stdio MCP server rather than a REST API).
+- [API_REFERENCE.md](API_REFERENCE.md) — maps every MCP tool to the real KoboToolbox REST endpoint(s) behind it, so you can test/reproduce any tool's behavior directly with `curl`, independent of MCP.
 - CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs typecheck, test, and build on every push/PR to `main`.
 
 ## Publishing (for maintainers)
@@ -123,6 +128,7 @@ If you're deploying this against real humanitarian or personal data, the practic
 - `get_submissions` caps `limit` at 100 per call; page through with `start` for larger pulls. The scanning tools (`get_submission_stats`, `flag_incomplete_submissions`, `get_geo_submissions`, `get_validation_summary`, `find_duplicate_submissions`, `get_field_distribution`, `export_submissions_csv`) page internally up to a `maxRows` cap (default varies by tool, hard max 2000) to avoid unbounded API usage.
 - `view_submission_attachment` only returns `image/*` and `audio/*` attachments, and rejects anything over 8MB (use a smaller `size` for images, or `get_submission_attachments`'s download URL directly for large/video/document files). Like everything else, the fetched bytes are never logged.
 - `get_field_distribution` counts `select_multiple` answers per selected option, not per submission — a submission with 3 selected options contributes to 3 categories, so percentages (of respondents who answered) don't sum to 100. If the field is in `KOBO_REDACT_FIELDS`, every value is `[REDACTED]` before this tool sees it, so the distribution collapses to a single 100% category — a visibly wrong result, not a silent leak, consistent with how redaction affects `find_duplicate_submissions`.
+- `search_all_forms` matches a question by its bare name (not full path), so the same question name across differently-structured forms (e.g. `phone_number` at the root on one form, `contact/phone_number` on another) is found on both. It skips questions inside repeat groups, since Kobo's Mongo-style query filter doesn't reliably exact-match into nested repeat arrays; a form where the field only exists inside a repeat is reported under `formsSkipped`, not silently treated as a non-match. Defaults to scanning only `deployed` forms (drafts have no submissions) and caps scanning at 50 forms (`maxForms`, hard max 100) to bound API usage — pass `deploymentStatus: "any"` to include archived/draft forms too.
 - Requests retry automatically on transient failures (429/502/503/504 or network errors), up to 2 retries with backoff; 4xx errors (bad token, missing form) fail immediately and are returned as a tool error rather than crashing the server. Verified live against a real KoboToolbox server with an invalid token.
 - `flag_incomplete_submissions`'s repeat-group handling is best-effort: it matches submission JSON keys by the question's full path first, falling back to the bare question name, since Kobo's export shape for nested repeats isn't fully documented and hasn't been verified against a live account with repeat groups.
 - If a field is both `required` and in `KOBO_REDACT_FIELDS`, `flag_incomplete_submissions` will see `[REDACTED]` (a non-empty string) rather than the real value, so a genuinely blank answer on that field won't be flagged as missing — redaction is applied before any tool logic runs, with no exceptions. Similarly, redacting the field passed to `find_duplicate_submissions` makes every submission look identical on that field (a visibly wrong result, not a silent leak). Both are the deliberate cost of enforcing redaction in one place rather than per-tool.
